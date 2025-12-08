@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+wandb/
+
+# Large data folders
+outputs/
+results/

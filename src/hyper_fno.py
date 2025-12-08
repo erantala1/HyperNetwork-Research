@@ -1,11 +1,8 @@
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-from nn_FNO import FNO1d
-from torch.func import functional_call
 import torch.nn.functional as F
-from torch.func import vmap
-
+import numpy as np
 #mlp class to be used by hypernet
 class MLP_net_variable(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim, num_layers, activation=F.gelu, use_act = True, use_dropout=True):
@@ -44,7 +41,6 @@ class MLP_net_variable(nn.Module):
 #creates mlp, each with specified number of layers and hidden dim, for each param of outer network
 #returns dictionary with updates for main network's params
 class HyperNetwork(nn.Module):
-    #def __init__(self, num_mlp_layers, in_dim, hyper_hidden_scale, skip_conv, skip_bias, rank, network, device):
     def __init__(self, num_mlp_layers, in_dim, hyper_hidden_scale, which_params, rank, network, device):
         super().__init__()
         self.fno = network.to(device)
@@ -52,44 +48,89 @@ class HyperNetwork(nn.Module):
         self.names = []
         self.shapes = []
         self.is_complex = []
-        self.hyper_layers = nn.ModuleList()
+        #self.hyper_layers = nn.ModuleList()
         self.indices = {}
         self.num_mlp_layers = num_mlp_layers
         self.hyper_hidden_scale = hyper_hidden_scale
-        #self.skip_conv = skip_conv
-        #self.skip_bias = skip_bias
         self.rank = rank
         self.which_params = which_params
 
+        # new version - one big mlp, split by param shapes and perform same rank 1 updates to each parameter
+        self.param_splits = {}   # name : { rank_idx → list[(start,end), ...] }
+        out_dim = 0
+
+        for i in range(self.rank):
+            for name, param in self.fno.named_parameters():
+                if name not in self.which_params:
+                    continue
+
+                dims = list(param.shape)
+                size = sum(dims)
+                if param.is_complex():
+                    size *= 2
+
+                if name not in self.param_splits:
+                    self.param_splits[name] = {}
+
+                splits = []
+                start = out_dim
+                if param.is_complex():
+                    cur = start
+                    for d in dims:
+                        splits.append((cur, cur + d))
+                        cur += d
+                    for d in dims:
+                        splits.append((cur, cur + d))
+                        cur += d
+                else:
+                    cur = start
+                    for d in dims:
+                        splits.append((cur, cur + d))
+                        cur += d
+
+                self.param_splits[name][i] = splits
+
+                out_dim += size
+
+        hyper_hidden_width = int(out_dim * hyper_hidden_scale)
+        hyper_hidden_width = max(hyper_hidden_width, 1)
+        print(f"in_dim{in_dim}, hidden_width: {hyper_hidden_width}, out_dim: {out_dim}")
+        self.mlp = MLP_net_variable(in_dim, out_dim, hyper_hidden_width, self.num_mlp_layers, activation=F.gelu, use_act=False, use_dropout=False).to(device)
+
+        # old version - mlp for each param
+        '''
         #each mlp's output dimension will be the sum of the outer network parameter's shape
         for i in range(self.rank):
             for name, param in self.fno.named_parameters():
                 if name not in self.which_params:
                     continue
-                '''
-                if self.skip_conv is True:
-                    if name.startswith("conv"):
-                        continue
-                if self.skip_bias is True:
-                    if "bias" in name:
-                        continue
-                '''
+
                 self.names.append(name)
                 self.shapes.append(param.shape)
                 self.is_complex.append(param.is_complex())
-                out_dim = sum(param.shape)
+                dims = list(param.shape)
+                out_dim = sum(dims)
+                # precompute split indices for this param to speed up updating process
+                splits = []
+                start = 0
+                for d in dims:
+                    end = start + d
+                    splits.append((start, end))
+                    start = end
+                self.param_splits[name] = splits
                 if param.is_complex():
                     out_dim *= 2
-                hyper_hidden_layer = int(out_dim * hyper_hidden_scale)
-                mlp = MLP_net_variable(in_dim, out_dim, hyper_hidden_layer, self.num_mlp_layers, activation=F.gelu, use_act = False, use_dropout=False).to(device)
+                hyper_hidden_width = int(out_dim * hyper_hidden_scale)
+                if hyper_hidden_width == 0:
+                    hyper_hidden_width = 1
+                mlp = MLP_net_variable(in_dim, out_dim, hyper_hidden_width, self.num_mlp_layers, activation=F.gelu, use_act = False, use_dropout=False).to(device)
                 self.indices[name+f"{i}"] = len(self.hyper_layers)
                 self.hyper_layers.append(mlp)
                 print(f"Name:{name}")
-
-    #mlp output dimension is sum of shape
-    #output will be split along param shape
-    def make_vectors(self, mlp_out, param_shape):
-        return list(mlp_out.split(param_shape, dim=1))
+        '''
+    def make_vectors(self, mlp_out, splits):
+        #splits = self.param_splits[name]  # list of (start, end)
+        return [mlp_out[:, start:end] for (start, end) in splits]
     
     #complex case where there are twice as many vectors (real and im)
     def split_complex(self, mlp_out, param_shape):
@@ -97,64 +138,49 @@ class HyperNetwork(nn.Module):
         update_real = self.make_vectors(real, param_shape)
         update_imag = self.make_vectors(imag, param_shape)
         return update_real, update_imag
-    
-    #makes rank 1 outer product between each of the mlp output vectors
-    def broadcasting(self, vecs, param_shape):
-        #vecs is a list containing each tensor to be used in outer product
-        if len(vecs) == 3:
-            v1,v2,v3 = vecs
-            d1,d2,d3 = param_shape
-            v1 = v1.view(-1, d1, 1, 1)
-            v2 = v2.view(-1, 1,  d2, 1)
-            v3 = v3.view(-1, 1,  1,  d3)
-            update = v1 * v2 * v3
-        elif len(vecs) == 2:
-            v1,v2 = vecs
-            d1,d2 = param_shape
-            v1 = v1.view(-1, d1, 1)
-            v2 = v2.view(-1, 1,  d2)
-            update = v1 * v2
-        elif len(vecs) == 1:
-            update = vecs[0]
-        return update
 
-    #update function used for each param
-    #split mlp output into vectors, then make outer product update
-    #real and imag update for complex param
-    def make_update(self, flat, param):
+    def broadcasting(self, vecs):
+        # vecs = [v1] or [v1, v2] or [v1, v2, v3]
+        if len(vecs) == 1:
+            return vecs[0]
+
+        elif len(vecs) == 2:
+            v1, v2 = vecs
+            return torch.einsum("bi, bj -> bij", v1, v2)
+
+        elif len(vecs) == 3:
+            v1, v2, v3 = vecs
+            return torch.einsum("bi, bj, bk -> b i j k", v1, v2, v3)
+
+    def make_update(self, flat, splits, param):
         if param.is_complex():
-            real, imag = flat.chunk(2, dim=1)
-            upd_r = self.broadcasting(self.make_vectors(real, param.shape), param.shape)
-            upd_i = self.broadcasting(self.make_vectors(imag, param.shape), param.shape)
-            update = torch.complex(upd_r, upd_i)
+            v = self.make_vectors(flat, splits)
+            v_real, v_imag = v[:(len(v)//2)], v[(len(v)//2):]
+            upd_r = self.broadcasting(v_real)
+            upd_i = self.broadcasting(v_imag)
+            return torch.complex(upd_r, upd_i)
         else:
-            vecs = self.make_vectors(flat, param.shape)
-            update = self.broadcasting(vecs, param.shape)
-        return update
-    
+            v = self.make_vectors(flat, splits)
+            return self.broadcasting(v)
+
     #for each param make rank number of updates and add to each parameter
     #returns dictionary of updated parameters to be used in functional_call
     def forward(self, u_0):
         B = u_0.shape[0]
         vec_u = u_0.reshape(B, -1)
         new_params = OrderedDict()
-
+        #all_flats = [mlp(vec_u) for mlp in self.hyper_layers] # pre-compute all mlp outputs successively for kernel latency
+        mlp_out = self.mlp(vec_u)
         for name, param in self.fno.named_parameters():              
-            '''
-            if name.startswith("conv") and self.skip_conv:
-                new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
-          
-            elif "bias" in name and self.skip_bias:
-                new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
-            '''
+
             if name not in self.which_params:
                 new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
             else:
                 for i in range(self.rank):
-                    index = self.indices[name+f"{i}"]
-                    mlp = self.hyper_layers[index]
-                    flat = mlp(vec_u)
-                    update = self.make_update(flat, param)
+                    #flat = all_flats[self.indices[name + f"{i}"]]
+                    #update = self.make_update(flat, param, name)
+                    splits = self.param_splits[name][i]
+                    update = self.make_update(mlp_out, splits, param)
                     if i == 0:
                         new_params[name] = param.unsqueeze(0) + update
                     else:

@@ -14,9 +14,9 @@ import sys
 #from count_trainable_params import count_parameters    
 import pickle
 #import matplotlib.pyplot as plt
-from nn_FNO import FNO1d
+from src.nn_FNO import FNO1d
 #from nn_MLP import MLP_Net
-from nn_step_methods import *
+from src.nn_step_methods import *
 
 skip_factor = 0 #Number of timesteps to skip (to make the saved data smaller), set to zero to not save a skipped version
 

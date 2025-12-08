@@ -128,3 +128,64 @@ class FNO1d(nn.Module):
         gridx = torch.tensor(np.linspace(0, 1, size_x), dtype=torch.float)
         gridx = gridx.reshape(1, size_x, 1).repeat([batchsize, 1, 1])
         return gridx.to(device)
+    
+    def forward_with_params(self, u, params):
+        """
+        Batched forward that uses per-sample dynamic parameters in `params`
+        for fc0, w0-w3, fc1, fc2 while leaving conv0-conv3 untouched.
+
+        u:      [B, S, time_history+1]   (input sequence; S = spatial grid size)
+        params: dict with keys:
+            "fc0.weight"   [B, width, time_history+1]
+            "fc0.bias"     [B, width]
+            "w0.weight"    [B, width, width, 1]
+            "w0.bias"      [B, width]
+            "w1.weight"
+            "w2.weight"
+            "w3.weight"
+            "fc1.weight"   [B, 128, width]
+            "fc1.bias"     [B, 128]
+            "fc2.weight"   [B, time_future, 128]
+            "fc2.bias"     [B, time_future]
+        """
+
+        grid = self.get_grid(u.shape, u.device)
+        x = torch.cat((u, grid), dim=-1)
+
+        W0 = params["fc0.weight"]
+        b0 = params["fc0.bias"]
+
+        x = torch.einsum("bst, bwt -> bsw", x, W0) + b0.unsqueeze(1)
+
+        x = x.permute(0, 2, 1)
+
+        for layer_idx in [0, 1, 2, 3]:
+            conv = getattr(self, f"conv{layer_idx}")
+            x1 = conv(x)
+
+            W = params[f"w{layer_idx}.weight"]
+            b = params[f"w{layer_idx}.bias"]
+
+            W = W.squeeze(-1)
+
+            x2 = torch.einsum("b i s , b o i -> b o s", x, W) + b.unsqueeze(-1)
+
+            x = x1 + x2
+
+            if layer_idx < 3:
+                x = F.gelu(x)
+
+        x = x.permute(0, 2, 1)
+
+        W1 = params["fc1.weight"]
+        b1 = params["fc1.bias"]
+
+        x = torch.einsum("bsw, baw -> bsa", x, W1) + b1.unsqueeze(1)
+        x = F.gelu(x)
+
+        W2 = params["fc2.weight"]
+        b2 = params["fc2.bias"]
+
+        x = torch.einsum("bsf, btf -> bst", x, W2) + b2.unsqueeze(1)
+
+        return x   # [B, S, time_future]

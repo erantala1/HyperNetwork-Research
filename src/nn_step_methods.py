@@ -174,15 +174,16 @@ class Switch_Euler_step(nn.Module):
 
     def hyper_implicit_forward(self, u_0):
         new_params = self.hyper_network(u_0.to(self.device))
-        u_1 = u_0.to(self.device) + self.time_step*(torch.vmap(self.batch_functional, in_dims=(0, 0))(new_params, u_0.to(self.device)))
+        #u_1 = u_0.to(self.device) + self.time_step*(torch.vmap(self.batch_functional, in_dims=(0, 0))(new_params, u_0.to(self.device)))
+        u_1 = u_0.to(self.device) + self.time_step*(self.network.forward_with_params(u_0.to(self.device), new_params))
         iter = 0
         while iter < self.num_iters:
            u_1 = self.hyper_implicit_forwards_inner(u_0, u_1, new_params)
            iter += 1
         return u_1
     def hyper_implicit_forwards_inner(self, u_0, u_1, new_params):
-        return u_0.to(self.device) + self.time_step*(torch.vmap(self.batch_functional, in_dims=(0, 0))(new_params, u_1.to(self.device)))
-
+        #return u_0.to(self.device) + self.time_step*(torch.vmap(self.batch_functional, in_dims=(0, 0))(new_params, u_1.to(self.device)))
+        return u_0.to(self.device) + self.time_step*(self.network.forward_with_params(u_1.to(self.device), new_params))
     
     def train_implicit(self, loss_func, u_0, u_1):
        return loss_func(self.implicit_backwards(u_0,u_1), u_0)
@@ -199,4 +200,9 @@ class Switch_Euler_step(nn.Module):
         return u_0.to(self.device) - self.time_step*(torch.vmap(self.batch_functional, in_dims=(0, 0))(new_params, u_1.to(self.device)))
 
     def altered_forward(self, u_0, u_1):
-        return u_0.to(self.device) + self.time_step*(self.network(u_1.to(self.device)))
+        u_1 = u_0.to(self.device) + self.time_step*(self.network(u_1.to(self.device)))
+        iter = 0
+        while iter < self.num_iters:
+           u_1 = self.implicit_forwards_inner_fno(u_0, u_1)
+           iter += 1
+        return u_1
