@@ -1,7 +1,7 @@
-# implicit-euler-research
+# HyperNetwork-Research
 Evan Rantala
 
-This research explores pairing a custom hypernetwork architecture with implicit numerical methods and amFourier Neural Operator for learning stable rollouts of nonlinear PDEs. This work is focused on finding a stable architectural advantage when significantly reducing FLOP count. 
+This research explores the use of a custom hyper network architecture for iterative constraint problems. Current applications are for autoregressive rollouts, one with a Fourier Neural Operator for KS system, and another with UNET diffusion for 2D turbulence. This work is focused on finding a stable architectural advantage when significantly reducing FLOP count. 
 
 ## Files Used for Training/Testing
 
@@ -12,12 +12,20 @@ This research explores pairing a custom hypernetwork architecture with implicit 
     - `nn_train_multistep.py`   - Training FNO with Hyper Network
     - `plotting.ipynb`          - Plot results of rollouts
 
+- diffusion/
+    - `hypernet.py`             - Custom Hyper Network architecture
+    - `models.py`               - UNET diffusion modules
+    - `train.py`                - Train UNET diffusion optionally with Hyper Network
+    - `sampler.py`              - Autoregressive sampling with plotting
+    - `sde.py`                  - Forward, reverse processes and sampling
+
+
 ## Setup
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/erantala1/Implicit_Euler_Research
-cd Implicit_Euler_Research
+git clone https://github.com/erantala1/HyperNetwork-Research
+cd HyperNetwork-Research
 ```
 ### 2. Create a virtual environment
 ```bash
@@ -25,6 +33,11 @@ conda env create -f environment.yml
 conda activate your_environment_name
 ```
 ### To train a model
+```bash
+cd diffusion
+python train.py
+```
+
 ```bash
 cd src
 python nn_train_multistep.py
