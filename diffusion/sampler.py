@@ -23,8 +23,10 @@ except ImportError as e:
 # --- Output Directories ---
 BASE_DIR = "/glade/derecho/scratch/erantala/project_runs/model_chkpts/diffusion"
 output_base_dir = "/glade/u/home/erantala/jacobian_research"
+model_name = "hypernet_unet_width_8" # change per experiment
 
 plot_dir = os.path.join(output_base_dir, "diffusion_plots")
+plot_dir = os.path.join(plot_dir, model_name)
 video_dir = os.path.join(output_base_dir, "video")
 numpy_dir = os.path.join(output_base_dir, "numpy_data")
 os.makedirs(plot_dir, exist_ok=True)
@@ -33,21 +35,39 @@ os.makedirs(numpy_dir, exist_ok=True)
 print(f"Output base directory: {os.path.abspath(output_base_dir)}")
 
 # --- Model and Data ---
-#modelfile = os.path.join(BASE_DIR, "baseline_test/model_epoch_80.pt") 
-modelfile = os.path.join(BASE_DIR, "baseline_hyper_test/model_epoch_50.pt")
-hypernetfile = os.path.join(BASE_DIR, "baseline_hyper_test/hypernet_epoch_50.pt")
-start_data_idx = 12800
-num_rollout_steps = 10
+# gamma = 6 models ___________________________________________________________________
+#modelfile = os.path.join(BASE_DIR, "baseline_v2/model_epoch_85.pt") # keep 85
+#modelfile = os.path.join(BASE_DIR, "baseline_hyper_v2/model_epoch_55.pt")
+#hypernetfile = os.path.join(BASE_DIR, "baseline_hyper_v2/hypernet_epoch_55.pt")
+#modelfile = os.path.join(BASE_DIR, "reduced_v2/model_epoch_90.pt") # 90 is best
+#hypernetfile = os.path.join(BASE_DIR, "reduced_v2/hypernet_epoch_90.pt")
+
+
+# gamma = 5 models _____________________________________________________________________
+#modelfile = os.path.join(BASE_DIR, "baseline_v3/model_epoch_70.pt") # 95 mean shift
+
+#modelfile = os.path.join(BASE_DIR, "multiple_mlps_reduced_hyper/model_epoch_105.pt")
+#hypernetfile = os.path.join(BASE_DIR, "multiple_mlps_reduced_hyper/hypernet_epoch_90.pt")
+
+modelfile = os.path.join(BASE_DIR, "width8_hyper/model_epoch_120.pt")
+hypernetfile = os.path.join(BASE_DIR, "width8_hyper/hypernet_epoch_120.pt")
+
+#modelfile = os.path.join(BASE_DIR, "width8_no_hyper/model_epoch_90.pt") # width 8 hyper
+
+
+start_data_idx = 14000
+num_rollout_steps = 100
+
 
 # --- Sampling Parameters ---
 num_sampling_steps = 1000
 sde_eps = 1e-3
 
 # --- Plotting and Video Parameters ---
-#save_milestones = [1, 5, 10, 100, 250, 500, 1000, 2000, 3000]
-save_milestones = [1,2,3, 5,8,10]
-output_video_filename = os.path.join(video_dir, "rollout_comparison.mp4")
-output_numpy_filename = os.path.join(numpy_dir, "rollout_predictions.npz")
+#save_milestones = [1, 50, 100, 250, 500, 750, 1000, 1500, 2000, 3000]
+save_milestones = [1, 5, 10, 20, 50, 75, 100]
+output_video_filename = os.path.join(video_dir, f"{model_name}_comparison.mp4")
+output_numpy_filename = os.path.join(numpy_dir, f"{model_name}_predictions.npz")
 fps = 30
 
 # --- Define constant color bar limits ---
@@ -70,24 +90,24 @@ print(f"Using device: {device}")
 # ==============================================================================
 
 @torch.inference_mode()
-def reverse_sde_sampler(model_state, vpsde, condition_x_t, delta_shape, num_steps, rng, eps, device, hypernet=None, preprocess_step=None):
+def reverse_sde_sampler(model_state, vpsde, condition_x_t, delta_shape, num_steps, eps, device, hypernet=None, preprocess_step=None):
     use_hnet = (hypernet is not None) and (preprocess_step is not None)
     T = float(vpsde.T)
     time_steps = torch.linspace(T, eps, steps=num_steps, device=device, dtype=torch.float32)
     dt = (eps - T) / num_steps
+    dt_tensor = torch.tensor(dt, device=device)
     y_t = vpsde.prior_sampling(delta_shape, device).to(device)
 
     if use_hnet:
-        noisy_x_t = condition_x_t
-        z = preprocess_step(noisy_x_t)
+        z = preprocess_step(condition_x_t)
         params_batched = hypernet(z)
         params = {k: v.squeeze(0) for k, v in params_batched.items()} 
 
     for i in range(num_steps - 1):
         t = time_steps[i]
         if use_hnet:
-            model_input = torch.cat([y_t, noisy_x_t], dim=0)
-            score = functional_call(model, params, (t, model_input))
+            model_input = torch.cat([y_t, condition_x_t], dim=0)
+            score = functional_call(model_state, params, (t, model_input))
         else:
             model_input = torch.cat([y_t, condition_x_t], dim=0)
             score = model_state(t, model_input)
@@ -96,8 +116,8 @@ def reverse_sde_sampler(model_state, vpsde, condition_x_t, delta_shape, num_step
         drift = -0.5 * beta_t * y_t - beta_t * score
 
         diffusion_coeff = torch.sqrt(beta_t)
-        noise = torch.randn(y_t.shape, generator=rng, device=device, dtype=y_t.dtype)
-        y_t = y_t + drift * dt + diffusion_coeff * torch.sqrt(torch.tensor(-dt, device=device)) * noise
+        noise = torch.randn(y_t.shape, device=device, dtype=y_t.dtype)
+        y_t = y_t + drift * dt + diffusion_coeff * torch.sqrt(-dt_tensor) * noise
 
     return y_t
 
@@ -122,9 +142,9 @@ if RUN_SIMULATION:
     if USE_HYPERNET:
         print(f"Loading hypernetwork model from {hypernetfile}...")
         hypernet, preprocess_step = load_hypernet(hypernetfile, model, device)
+    else:
+        hypernet, preprocess_step = None, None
 
-    base_seed = 20
-    loop_gen = torch.Generator(device=device).manual_seed(base_seed)
 
     vpsde = VPSDE(beta_min=0.01, beta_max=55.0, T=1.0, schedule_type="power", power=5).to(device)
 
@@ -160,28 +180,20 @@ if RUN_SIMULATION:
         for k in tqdm(range(num_rollout_steps), desc="Rollout Simulation"):
             condition_x_t = current_predicted_x 
 
-            # "Split" generator by drawing a fresh seed deterministically
-            # so each rollout step uses an independent RNG stream.
-            step_seed = torch.randint(
-                low=0, high=2**31 - 1, size=(1,), generator=loop_gen, device=device
-            ).item()
-            sampling_gen = torch.Generator(device=device).manual_seed(step_seed)
-
             predicted_delta = reverse_sde_sampler(
                 model_state=model,
                 vpsde=vpsde,
                 condition_x_t=condition_x_t,
                 delta_shape=delta_shape,
                 num_steps=num_sampling_steps,
-                rng=sampling_gen,
                 eps=sde_eps,
                 device=device,
                 hypernet=hypernet,
                 preprocess_step=preprocess_step
             )
 
-            # x_t+1 = x_t + delta_x
             current_predicted_x = condition_x_t + predicted_delta
+
 
             predicted_states_list_np.append(current_predicted_x.detach().cpu().numpy())
 
@@ -439,6 +451,7 @@ if RUN_POSTPROCESSING:
                     f"Autoregressive Rollout: Step {current_step_number}", fontsize=16
                 )
                 plt.subplots_adjust(hspace=0.4, wspace=0.3)
+
                 plot_filename = os.path.join(plot_dir, f"rollout_step_{current_step_number:04d}.png")
                 plt.savefig(plot_filename, dpi=150, bbox_inches="tight")
                 plt.close(fig_milestone)

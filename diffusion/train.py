@@ -4,6 +4,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.func import vmap
 from tqdm import tqdm
 import wandb
 from dataloaders import *
@@ -16,15 +17,15 @@ from hypernet import *
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-output_dir = "/glade/derecho/scratch/erantala/project_runs/model_chkpts/diffusion/baseline_test"
+output_dir = "/glade/derecho/scratch/erantala/project_runs/model_chkpts/diffusion/width8_hyper"
 os.makedirs(output_dir, exist_ok=True)
 
 data_dir = "/glade/derecho/scratch/cainslie/beta-channel-turbulence/data_low_res/data_lowres"
-data = load_turbulence_data(data_dir, stop_idx=12799, normalize=True)
+data = load_turbulence_data(data_dir, stop_idx=13500, normalize=True)
 
 batch_size = 2
 dt = 1
-num_epochs = 100
+num_epochs = 70
 save_every = 5
 learning_rate = 1e-4
 num_Taus = 4
@@ -36,6 +37,19 @@ hyperparameters = {
     "data_shape": (2, 256, 256),
     #"data_shape": (1, 256, 256), # test for no concatentation, only hypernetwork conditioning
     "dim_mults": [2, 4, 4, 8, 16],
+    "hidden_size": 8,
+    "heads": 16,
+    "dim_head": 32,
+    "dropout_rate": 0.1,
+    "num_res_blocks": 2,
+    "attn_resolutions": [32, 16, 8],
+}
+'''
+# baseline hyperparameters
+hyperparameters = {
+    "data_shape": (2, 256, 256),
+    #"data_shape": (1, 256, 256), # test for no concatentation, only hypernetwork conditioning
+    "dim_mults": [2, 4, 4, 8, 16],
     "hidden_size": 16,
     "heads": 32,
     "dim_head": 64,
@@ -43,7 +57,7 @@ hyperparameters = {
     "num_res_blocks": 2,
     "attn_resolutions": [32, 16, 8],
 }
-
+'''
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
@@ -67,18 +81,19 @@ print(f"Val frames:   {len(val_indices)} (idx {val_indices[0]}..{val_indices[-1]
 # MODEL + HYPERNET + SDE
 # ==============================================================================
 model = createModel(**hyperparameters).to(device).float()
-vpsde = VPSDE(beta_min=0.01, beta_max=55.0, T=1.0, schedule_type="power", power=6).to(device)
-noise_std = 0.01
-
-use_hypernet = False # set to false when just using UNET
+vpsde = VPSDE(beta_min=0.01, beta_max=55.0, T=1.0, schedule_type="power", power=5).to(device)
+noise_std = 0.05 # changed from 0.01
+print(noise_std)
+use_hypernet = True # set to false when just using UNET
 if use_hypernet:
     C_state = 1
-    preprocess_step = PoolPyramidConditioner(C=C_state, sizes=(32, 16, 8), add_moments=True).to(device)
-    rank = 1
-    num_mlp_layers = 16
+    preprocess_step = PoolPyramidConditioner(C=C_state, sizes=(32, 16, 8)).to(device)
+    #rank = 1
+    num_mlp_layers = 10
     in_dim = preprocess_step.out_dim
-    hyper_hidden_scale = 0.3
-    hypernet = HyperNetwork(num_mlp_layers, in_dim, hyper_hidden_scale, rank, model, device).to(device)
+    hyper_hidden_scale = 1.0
+    one_mlp = False
+    hypernet = HyperNetwork(num_mlp_layers, in_dim, hyper_hidden_scale, one_mlp, model, device).to(device)
 
 # ==============================================================================
 # LOSS
@@ -93,10 +108,13 @@ def batch_loss(model, taus, input_batch, x_dt):
         x = input_batch[b]
         y = x_dt[b]
         tau_losses = []
-        for k in range(taus.shape[0]):
-            t = taus[k]
-            tau_losses.append(score_loss_fn(model, t, x, y))
-        losses.append(torch.stack(tau_losses))
+        per_tau = torch.vmap(
+            lambda t: score_loss_fn(model, t, x, y),
+            in_dims=0,
+            randomness="different",
+        )
+        tau_losses = per_tau(taus)
+        losses.append(tau_losses)
     return torch.stack(losses).mean()
 
 def batch_loss_hyper(model, hypernet, preprocess_step, taus, input_batch, x_dt):
@@ -110,21 +128,22 @@ def batch_loss_hyper(model, hypernet, preprocess_step, taus, input_batch, x_dt):
     for b in range(B):
         x = input_batch[b]
         y = x_dt[b]
-        x_t = x[1:2]
-        z = preprocess_step(x_t)
-        params = {k: v[b] for k, v in params_batched.items()}
-        tau_losses = []
-        for k in range(taus.shape[0]):
-            t = taus[k]
-            tau_losses.append(score_loss_fn(model, t, x, y, params))
-        losses.append(torch.stack(tau_losses))
+        params = {name: param[b] for name, param in params_batched.items()}
+
+        per_tau = torch.vmap(
+            lambda t: score_loss_fn(model, t, x, y, params),
+            in_dims=0,
+            randomness="different",
+        )
+        tau_losses = per_tau(taus)
+        losses.append(tau_losses)
     return torch.stack(losses).mean()
 
 # ==============================================================================
 # OPTIMIZER + SCHEDULE
 # ==============================================================================
 initial_lr = learning_rate
-decay_steps = 120000
+decay_steps = 50000
 end_lr = 1e-5
 
 def cosine_decay(step, initial_lr, end_lr, decay_steps):
@@ -134,12 +153,16 @@ def cosine_decay(step, initial_lr, end_lr, decay_steps):
     return end_lr + (initial_lr - end_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 gradient_clip_norm = 0.25
-optimizer = optim.AdamW(model.parameters(), lr=initial_lr)
 
 if use_hypernet:
-    initial_lr_hyper = 1e-5
-    end_hyper_lr = 1e-6
+    initial_lr_hyper = 3e-5 # this seems to work pretty well
+    end_hyper_lr = 9e-7
     optimizer_hyper = optim.AdamW(hypernet.parameters(), lr=initial_lr_hyper)
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr)
+
+else:
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr)
+    optimizer_hyper = None
 
 def update_step(model, optimizer, step, taus, input_batch, x_dt):
     lr = cosine_decay(step, initial_lr, end_lr, decay_steps)
@@ -172,7 +195,13 @@ def hyper_update_step(model, hypernet, preprocess_step, optimizer, optimizer_hyp
 
 @torch.no_grad()
 def run_validation(model, val_data, hypernet=None, preprocess_step=None):
+    
     model.eval()
+    if hypernet is not None:
+        hypernet.eval()
+    if preprocess_step is not None:
+        preprocess_step.eval()
+
     val_loader = create_turbulence_dataloader(val_data, batch_size, dt=dt, shuffle=False)
     num_samples_val = len(val_data) - dt
     num_batches_val = num_samples_val // batch_size
@@ -196,11 +225,16 @@ def run_validation(model, val_data, hypernet=None, preprocess_step=None):
             break
 
     model.train()
+    if hypernet is not None:
+        hypernet.train()
+    if preprocess_step is not None:
+        preprocess_step.train()
     return float(torch.tensor(losses).mean()) if len(losses) else float("nan")
 
 # ==============================================================================
 # WANDB
 # ==============================================================================
+
 run = wandb.init(
     entity="erantala-university-of-california",
     project="HyperNet_Diffusion",
@@ -211,29 +245,41 @@ run = wandb.init(
         "dt": dt,
         "num_epochs": num_epochs,
         "num_Taus": num_Taus,
-        "save_every": save_every,
         "save_path": output_dir,
-        "train_frac": train_frac,
-        "use_hypernet": use_hypernet,
-        "concatenation_cond": True,
-        #"Hyper in_dim": 1346,
-        #"Hyper hidden_dim": 6049,
-        #"Hyper out_dim": 20165
+        "use_hypernet": use_hypernet
     },
 )
 wandb.define_metric("epoch")
 wandb.define_metric("epoch/*", step_metric="epoch")
 
+num_samples_train = len(train_data) - dt
+num_batches_train = num_samples_train // batch_size
+
+# ==============================================================================
+# RESUME TRAINING
+# ==============================================================================
+RESUME = True
+if RESUME:
+    epoch_to_resume = 90
+    if use_hypernet:
+        model, start_epoch, global_step, optimizer, hypernet, optimizer_hyper = resume_training(output_dir, 
+                                                                                                epoch_to_resume, model, 
+                                                                                                optimizer, device, 
+                                                                                                use_hypernet,
+                                                                                                hypernet=hypernet, 
+                                                                                                optimizer_hyper=optimizer_hyper)
+    else:
+        model, start_epoch, global_step, optimizer = resume_training(output_dir, epoch_to_resume, model, optimizer, device, use_hypernet)
+else:
+    start_epoch = 1
+    global_step = 0
+    print(f"Starting training: {num_epochs} epochs with {num_batches_train} train batches/epoch")
+
 # ==============================================================================
 # TRAIN LOOP
 # ==============================================================================
-num_samples_train = len(train_data) - dt
-num_batches_train = num_samples_train // batch_size
-print(f"Starting training: {num_epochs} epochs with {num_batches_train} train batches/epoch")
 
-global_step = 0
-
-for epoch in range(1, num_epochs + 1):
+for epoch in range(start_epoch, num_epochs + 1):
     model.train()
     train_loader = create_turbulence_dataloader(train_data, batch_size, dt=dt, shuffle=True)
 
@@ -277,16 +323,27 @@ for epoch in range(1, num_epochs + 1):
         val_loss = run_validation(model, val_data)
 
     print(f"Epoch {epoch} - Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
-    run.log(
+    if use_hypernet:
+        run.log(
         {
             "epoch": epoch,
             "epoch/train_loss": train_loss,
             "epoch/val_loss": val_loss,
             "epoch/lr": optimizer.param_groups[0]["lr"],
+            "epoch/hyper_lr": optimizer_hyper.param_groups[0]["lr"]
         },
         step=epoch,
-    )
+        )
+    else:
+        run.log(
+            {
+                "epoch": epoch,
+                "epoch/train_loss": train_loss,
+                "epoch/val_loss": val_loss,
+                "epoch/lr": optimizer.param_groups[0]["lr"],
+            },
+            step=epoch,
+        )
 
     if epoch % save_every == 0:
         save_path = os.path.join(output_dir, f"model_epoch_{epoch}.pt")
@@ -294,7 +351,24 @@ for epoch in range(1, num_epochs + 1):
         print(f"Model saved to {save_path}")
         if use_hypernet:
             torch.save(hypernet.state_dict(), os.path.join(output_dir, f"hypernet_epoch_{epoch}.pt"))
-
+            torch.save({ 
+                "optimizer": optimizer.state_dict(), 
+                "optimizer_hyper": optimizer_hyper.state_dict(), 
+                "lr": optimizer.param_groups[0]["lr"], 
+                "lr_hyper": optimizer_hyper.param_groups[0]["lr"], 
+                "epoch": epoch,
+                "global_step": global_step
+                }, 
+                os.path.join(output_dir, f"optimizer_lr_epoch_gs_{epoch}.pt"))
+        else:
+            torch.save({ 
+                "optimizer": optimizer.state_dict(), 
+                "lr": optimizer.param_groups[0]["lr"], 
+                "epoch": epoch,
+                "global_step": global_step
+                }, 
+                os.path.join(output_dir, f"optimizer_lr_epoch_gs_{epoch}.pt"))
+        
 saveModel(os.path.join(output_dir, "model_final.pt"), hyperparameters, model)
 if use_hypernet:
     torch.save(hypernet.state_dict(), os.path.join(output_dir, "hypernet_final.pt"))

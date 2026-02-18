@@ -4,14 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PoolPyramidConditioner(nn.Module):
-    def __init__(self, C: int, sizes=(32, 16, 8), add_moments=True):
+    def __init__(self, C: int, sizes=(32, 16, 8)):
         super().__init__()
         self.C = C
         self.sizes = sizes
-        self.add_moments = add_moments
         out_dim = sum(C * s * s for s in sizes)
-        if add_moments:
-            out_dim += 2 * C
+
         self.out_dim = out_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -28,11 +26,6 @@ class PoolPyramidConditioner(nn.Module):
             feats.append(pooled.reshape(B, -1))
 
         z = torch.cat(feats, dim=1)
-
-        if self.add_moments:
-            mu = x.mean(dim=(2, 3)) 
-            sigma = x.std(dim=(2, 3), unbiased=False)
-            z = torch.cat([z, mu, sigma], dim=1)
 
         if added_batch:
             z = z.squeeze(0)
