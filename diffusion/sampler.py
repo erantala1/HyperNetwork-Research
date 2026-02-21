@@ -6,15 +6,11 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import imageio
 from torch.func import functional_call
-
-try:
-    from utils import loadModel, load_hypernet
-    from dataloaders import load_turbulence_data
-    from sde import VPSDE
-except ImportError as e:
-    print(f"Error importing project files: {e}")
-    print("Please ensure utils.py, dataloaders.py, sde.py are accessible.")
-    raise
+from wrapper import Step
+from utils import loadModel, load_hypernet
+from dataloaders import load_turbulence_data
+from sde import VPSDE
+import os, sys
 
 # ==============================================================================
 #                           CONFIGURATION
@@ -23,7 +19,7 @@ except ImportError as e:
 # --- Output Directories ---
 BASE_DIR = "/glade/derecho/scratch/erantala/project_runs/model_chkpts/diffusion"
 output_base_dir = "/glade/u/home/erantala/jacobian_research"
-model_name = "hypernet_unet_width_8" # change per experiment
+model_name = "testing" # change per experiment
 
 plot_dir = os.path.join(output_base_dir, "diffusion_plots")
 plot_dir = os.path.join(plot_dir, model_name)
@@ -44,10 +40,10 @@ print(f"Output base directory: {os.path.abspath(output_base_dir)}")
 
 
 # gamma = 5 models _____________________________________________________________________
-#modelfile = os.path.join(BASE_DIR, "baseline_v3/model_epoch_70.pt") # 95 mean shift
+#modelfile = os.path.join(BASE_DIR, "baseline_v3/model_epoch_80.pt") # 95 mean shift
 
 #modelfile = os.path.join(BASE_DIR, "multiple_mlps_reduced_hyper/model_epoch_105.pt")
-#hypernetfile = os.path.join(BASE_DIR, "multiple_mlps_reduced_hyper/hypernet_epoch_90.pt")
+#hypernetfile = os.path.join(BASE_DIR, "multiple_mlps_reduced_hyper/hypernet_epoch_105.pt")
 
 modelfile = os.path.join(BASE_DIR, "width8_hyper/model_epoch_120.pt")
 hypernetfile = os.path.join(BASE_DIR, "width8_hyper/hypernet_epoch_120.pt")
@@ -55,8 +51,9 @@ hypernetfile = os.path.join(BASE_DIR, "width8_hyper/hypernet_epoch_120.pt")
 #modelfile = os.path.join(BASE_DIR, "width8_no_hyper/model_epoch_90.pt") # width 8 hyper
 
 
-start_data_idx = 14000
-num_rollout_steps = 100
+#start_data_idx = 14000
+start_data_idx = 10000 # trying to start from training data
+num_rollout_steps = 5
 
 
 # --- Sampling Parameters ---
@@ -99,15 +96,17 @@ def reverse_sde_sampler(model_state, vpsde, condition_x_t, delta_shape, num_step
     y_t = vpsde.prior_sampling(delta_shape, device).to(device)
 
     if use_hnet:
-        z = preprocess_step(condition_x_t)
-        params_batched = hypernet(z)
-        params = {k: v.squeeze(0) for k, v in params_batched.items()} 
+        #z = preprocess_step(condition_x_t)
+        #params_batched = hypernet(z)
+        #params = {k: v.squeeze(0) for k, v in params_batched.items()}
+        wrapper.make_params(condition_x_t)
 
     for i in range(num_steps - 1):
         t = time_steps[i]
         if use_hnet:
             model_input = torch.cat([y_t, condition_x_t], dim=0)
-            score = functional_call(model_state, params, (t, model_input))
+            #score = functional_call(model_state, params, (t, model_input))
+            score = wrapper(model_input, t) 
         else:
             model_input = torch.cat([y_t, condition_x_t], dim=0)
             score = model_state(t, model_input)
@@ -128,7 +127,8 @@ def reverse_sde_sampler(model_state, vpsde, condition_x_t, delta_shape, num_step
 
 if RUN_SIMULATION:
     print("\n--- PHASE 1: Starting Simulation ---")
-
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     print(f"Loading model from {modelfile}...")
     try:
         model = loadModel(modelfile)
@@ -142,10 +142,14 @@ if RUN_SIMULATION:
     if USE_HYPERNET:
         print(f"Loading hypernetwork model from {hypernetfile}...")
         hypernet, preprocess_step = load_hypernet(hypernetfile, model, device)
+        wrapper = Step(model, hypernet, preprocess_step)
+        #wrapper.make_params = torch.compile(wrapper.make_params)
+        #wrapper = torch.compile(wrapper)
     else:
         hypernet, preprocess_step = None, None
+        #model = torch.compile(model)
 
-
+    
     vpsde = VPSDE(beta_min=0.01, beta_max=55.0, T=1.0, schedule_type="power", power=5).to(device)
 
     data_dir = "/glade/derecho/scratch/cainslie/beta-channel-turbulence/data_low_res/data_lowres"

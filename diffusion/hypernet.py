@@ -102,7 +102,7 @@ class HyperNetwork(nn.Module):
                 out_dim = sum(dims)
                 
                 # don't make mlp for smaller parameters
-                if out_dim < 256:
+                if out_dim < 512:
                     #print(f"Skipping {name}, out_dim : {out_dim}")
                     continue
                 
@@ -126,8 +126,12 @@ class HyperNetwork(nn.Module):
                 self.total_mlps += 1
 
             self.streams = [torch.cuda.Stream() for _ in range(len(self.hyper_layers))]
-            #print(f"TOTAL NUMBER OF MLPS: {self.total_mlps}")
-
+            self.jobs = []
+            self.base_params = dict(self.network.named_parameters()) # using this to avoid building full dict of params for functional call
+            # can use functional call with strict=False, faster runtime
+            for name, mlp_idx in self.indices.items():
+                self.jobs.append((name, mlp_idx, self.param_splits[name], self.base_params[name]))
+            
     
     def should_adapt(self, name):
         # parameters that don't depend on state shouldn't get updates
@@ -136,10 +140,10 @@ class HyperNetwork(nn.Module):
         if name.startswith("mlp"): return False
         return True
 
-    #def make_vectors(self, mlp_out, splits):
     def make_vectors(self, mlp_out, splits):
         return [mlp_out[:, start:end] for (start, end) in splits]
-
+    
+    '''
     def broadcasting(self, vecs):
         n = len(vecs)
         if n == 1:
@@ -152,38 +156,59 @@ class HyperNetwork(nn.Module):
         eq = ",".join(inputs) + "->" + out
 
         return torch.einsum(eq, *vecs)
+    '''
 
+    # changing to this was faster than einsum (less kernel launches)
+    def broadcasting(self, vecs):
+        n = len(vecs)
+        if n == 1:
+            return vecs[0]
+        if n == 2:
+            v0, v1 = vecs
+            return v0.unsqueeze(-1) * v1.unsqueeze(-2)
+        
+        out = vecs[0]
+        for i in range(1, n):
+            v = vecs[i]
+            out = out.unsqueeze(-1)
+            shape = [v.shape[0]] + [1] * (out.dim() - 2) + [v.shape[1]]
+            v_view = v.view(*shape)
+            out = out * v_view
+        return out
+    
     def make_update(self, mlp_out, splits):
         v = self.make_vectors(mlp_out, splits)
         return self.broadcasting(v)
 
-    def run_mlp(self, mlp, u, stream):
-        with torch.cuda.stream(stream):
-            return mlp(u)
-    
+
     def forward_multiple_mlp(self, u):
         if u.dim() == 1:
             u = u.unsqueeze(0)
-        B = u.shape[0]
-        new_params = OrderedDict()
-        outs = {}
-        for i, (name, mlp_idx) in enumerate(self.indices.items()):
-            outs[name] = self.run_mlp(self.hyper_layers[mlp_idx], u, self.streams[i])
-            #outs[name] = self.hyper_layers[mlp_idx](u)
-
-        for s in self.streams[:len(self.indices)]:
-            s.synchronize()
+        outs = [None] * len(self.hyper_layers)
+        new_params = {}
+        default_stream = torch.cuda.current_stream()
         
-        for name, param in self.network.named_parameters():              
-            if name not in self.param_splits:
-                new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
-            else:
-                mlp_out = outs[name]
-                splits = self.param_splits[name]
-                update = self.make_update(mlp_out, splits)
-                new_params[name] = param.unsqueeze(0) + update
+        # wait on default stream to finish prepping anything for mlps
+        for s in self.streams:
+            s.wait_stream(default_stream)
 
+        # mlp forward pass on designated stream, give chance to parallelize?
+        for (name, mlp_idx, splits, base) in self.jobs:
+            s = self.streams[mlp_idx]
+            with torch.cuda.stream(s):
+                outs[mlp_idx] = self.hyper_layers[mlp_idx](u)
+
+        # wait on mlps to be done before doing updates
+        for s in self.streams:
+            default_stream.wait_stream(s)
+
+        new_params = {}
+        for (name, mlp_idx, splits, base) in self.jobs:
+            update = self.make_update(outs[mlp_idx], splits)
+            new_params[name] = base.unsqueeze(0) + update
+        
         return new_params
+    
 
     def forward_one_mlp(self, u):
         if u.dim() == 1:
@@ -191,7 +216,7 @@ class HyperNetwork(nn.Module):
         B = u.shape[0]
         new_params = OrderedDict()
         mlp_out = self.mlp(u)
-        for name, param in self.network.named_parameters():              
+        for name, param in self.network.named_parameters():            
             if name not in self.param_splits:
                 new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
             else:
@@ -202,6 +227,7 @@ class HyperNetwork(nn.Module):
 
         return new_params
     
+
     def forward(self, u):
         if self.one_mlp:
             return self.forward_one_mlp(u)

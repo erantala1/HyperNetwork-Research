@@ -1,29 +1,10 @@
 import math
 import os
 import sys
-from contextlib import contextmanager
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
-
-# Suppress debug prints from GroupNorm if they exist
-@contextmanager
-def suppress_stdout_stderr():
-    """Context manager to suppress stdout and stderr"""
-    with open(os.devnull, "w") as devnull:
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        try:
-            sys.stdout = devnull
-            sys.stderr = devnull
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
@@ -56,8 +37,7 @@ class LinearTimeSelfAttention(nn.Module):
             remove_batch_dim = False
 
         n, c, h, w = x.shape
-        with suppress_stdout_stderr():
-            x = self.group_norm(x)
+        x = self.group_norm(x)
 
         qkv = self.to_qkv(x)  # (N, 3*heads*dim_head, H, W)
         qkv = rearrange(
@@ -194,8 +174,7 @@ class ResnetBlock(nn.Module):
 
         _, C, _, _ = x.shape
 
-        with suppress_stdout_stderr():
-            h = F.silu(self.block1_groupnorm(x))
+        h = F.silu(self.block1_groupnorm(x))
 
         if self.up or self.down:
             h = self.scaling(h)  # type: ignore
@@ -206,8 +185,7 @@ class ResnetBlock(nn.Module):
         t = self.mlp_layers(t)
         h = h + t[..., None, None]
 
-        with suppress_stdout_stderr():
-            h = self.block2_layers(h)
+        h = self.block2_layers(h)
 
         if C != self.dim_out or self.up or self.down:
             x = self.res_conv(x)
@@ -430,8 +408,7 @@ class UNet(nn.Module):
 
         assert len(hs) == 0
 
-        with suppress_stdout_stderr():
-            h = self.final_conv_layers(h)
+        h = self.final_conv_layers(h)
 
         if add_batch_dim:
             h = h.squeeze(0)
