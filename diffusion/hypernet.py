@@ -1,165 +1,92 @@
+
 import torch
 import torch.nn as nn
-from collections import OrderedDict
 import torch.nn.functional as F
-from torch.func import vmap
-import numpy as np
-import string
-
-#mlp class to be used by hypernet
-class MLP(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim, num_layers, activation=F.gelu, use_act = True, use_dropout=True):
-        super().__init__()
-        self.linear_in = nn.Linear(in_dim, hidden_dim)
-        torch.nn.init.xavier_normal_(self.linear_in.weight)
-        self.activation = activation
-        self.layers_1 = nn.ModuleList()
-        if use_dropout:
-            self.drop = nn.ModuleList()
-        self.use_drop = use_dropout
-        self.num_layers = num_layers
-        self.use_act = use_act
-        for i in range(0,num_layers): 
-            self.layers_1.append(nn.Linear(hidden_dim, hidden_dim))
-            torch.nn.init.xavier_normal_(self.layers_1[i].weight)
-            if use_dropout:
-                self.drop.append(nn.Dropout(p=0.5))
-        self.linear_out = nn.Linear(hidden_dim, out_dim)
-        torch.nn.init.xavier_normal_(self.linear_out.weight)
-
-    def forward(self, x):
-        x = self.activation(self.linear_in(x))
-        x_0 = x
-        for i in range(0,self.num_layers):
-            x = self.activation(self.layers_1[i](x)) 
-            if self.use_drop:
-                x = self.drop[i](x)
-            # x = x + x_0
-        x = self.linear_out(x)
-        if self.use_act:
-            x = self.activation(x)
-        return x
-
+import math
+from preprocess import *
+from fno import *
+import math
+from collections import defaultdict
 
 class HyperNetwork(nn.Module):
-    def __init__(self, num_mlp_layers, in_dim, hyper_hidden_scale, one_mlp, network, device):
+    def __init__(self, hidden_width, num_mlp_layers, network, device, rank=1):
         super().__init__()
-        '''
-        hyper_layers = [ MLP for param 1, MLP for param 2, ... ]
-        indices dict = {main network parameter name : corresponding mlp index in hyper_layers}
-        param_splits = [start index for vector 1, end index for vector 1/start index for vector 2....]
-                       (slice vectors from mlp outputs to make r1 outerproduct update)
-        '''
-        self.network = network.to(device)
         self.device = device
-        self.hyper_layers = nn.ModuleList()
         self.indices = {}
         self.num_mlp_layers = num_mlp_layers
-        self.hyper_hidden_scale = hyper_hidden_scale
-        self.one_mlp = one_mlp
+
+        self.total_mlps = 0
+        self.indices = {}
+        self.jobs = []
+        self.base_params = dict(network.named_parameters())
         
-        # one big mlp version, split by param shapes and perform same rank 1 updates to each parameter
-        self.param_splits = {}
-        out_dim = 0
-        
-        if self.one_mlp:
-            for name, param in self.network.named_parameters():
-                if not self.should_adapt(name):
-                    continue
-                print(f"Param: {name}, param shape: {param.shape}")
-                dims = list(param.shape)
-                size = sum(dims)
-   
-                if name not in self.param_splits:
-                    self.param_splits[name] = {}
+        mlp_names = []
+        out_dims = []
+        splits_list = []
+        hyper_hidden_width = hidden_width
+        self.preprocess_step = CNNConditioner()
+        #self.preprocess_step = FNOConditioner(in_channels=1, modes1=16, modes2=16, width=16, out_dim=512, num_layers=2, use_layernorm=False)
+        in_dim = self.preprocess_step.out_dim
+        self.rank = rank
 
-                splits = []
-                start = out_dim
-                cur = start
-                for d in dims:
-                    splits.append((cur, cur + d))
-                    cur += d
+        for rank_idx in range(self.rank):
+            for name, param in network.named_parameters():
+                #if not self.should_adapt(name):
+                #    continue
 
-                self.param_splits[name] = splits
-                out_dim += size
-
-            hyper_hidden_width = int(out_dim * hyper_hidden_scale)
-            #hyper_hidden_width = min(hyper_hidden_width, 2048) # still need to test what the right mlp size is
-            #hyper_hidden_width = 2 * out_dim
-            hyper_hidden_width = 1024
-            print(f"in_dim: {in_dim}, hidden_width: {hyper_hidden_width}, out_dim: {out_dim}")
-            self.mlp = MLP(in_dim, out_dim, hyper_hidden_width, self.num_mlp_layers, activation=F.gelu, use_act=False, use_dropout=False).to(device)
-        
-
-        #each mlp's output dimension will be the sum of the outer network parameter's shape
-        else:
-            self.total_mlps = 0
-            for name, param in self.network.named_parameters():
-                if not self.should_adapt(name):
-                    #print(f"Non applicable parameter: {name}")
-                    continue
                 dims = list(param.shape)
                 out_dim = sum(dims)
+
+                # if len(dims) == 4 and dims[2] != 1 and dims[3] != 1: # not giving updates to tensors
+                #     continue
+                # if len(dims) == 4: # hard coding this reshape logic for now 
+                #     out_dim -= 2
                 
-                # don't make mlp for smaller parameters
-                if out_dim < 512:
-                    #print(f"Skipping {name}, out_dim : {out_dim}")
-                    continue
+                # #if out_dim < 256:
+                # if out_dim < 32:
+                #     continue
                 
-                # precompute split indices for this param to speed up updating process
-                splits = []
-                start = 0
-                for d in dims:
-                    end = start + d
-                    splits.append((start, end))
-                    start = end
-                self.param_splits[name] = splits
-                
-                temp = int(out_dim * hyper_hidden_scale)
-                if temp % 8 != 0: # hidden width multiple of 8 for performance
-                    temp = (temp // 8) * 8
-                hyper_hidden_width = max(temp, 64)
-                mlp = MLP(in_dim, out_dim, hyper_hidden_width, self.num_mlp_layers, activation=F.gelu, use_act = False, use_dropout=False).to(device)
-                self.indices[name] = len(self.hyper_layers)
-                self.hyper_layers.append(mlp)
-                #print(f"Name:{name}, in_dim: {in_dim}, hidden_width: {hyper_hidden_width}, out_dim: {out_dim}")
+                print(f"MLP updating param: {name} with shape: {dims}, rank: {rank_idx}")
+                mlp_idx = self.total_mlps
+
+                mlp_names.append(f"{name}_rank{rank_idx}")
+                out_dims.append(out_dim)
+                splits_list.append(tuple(param.shape))
+                #splits_list.append(tuple(param.shape[:2]))
+
+                unsqueeze = (len(dims) == 4)
+                base = self.base_params[name]
+                #splits = tuple(base.shape[:2])
+                splits = tuple(base.shape)
+
+                self.jobs.append((name, mlp_idx, splits, base, unsqueeze))
                 self.total_mlps += 1
 
-            self.streams = [torch.cuda.Stream() for _ in range(len(self.hyper_layers))]
-            self.jobs = []
-            self.base_params = dict(self.network.named_parameters()) # using this to avoid building full dict of params for functional call
-            # can use functional call with strict=False, faster runtime
-            for name, mlp_idx in self.indices.items():
-                self.jobs.append((name, mlp_idx, self.param_splits[name], self.base_params[name]))
-            
-    
+        print(self.total_mlps)
+
+        self.batched_mlp = GroupedBatchedMLP(
+            out_dims=out_dims,
+            in_dim=in_dim,
+            hidden_dim=hyper_hidden_width,
+            num_hidden_layers=self.num_mlp_layers,
+            activation=F.gelu,
+            device=device,
+            dtype=torch.float32,
+        ).to(device)
+
     def should_adapt(self, name):
-        # parameters that don't depend on state shouldn't get updates
-        # time embedding parameters
         if name.startswith("time"): return False
-        if name.startswith("mlp"): return False
+        if "mlp" in name: return False
+        #if "block2" in name: return False
+        #if "conv" in name: return False
+        #if "bias" in name: return False
         return True
 
     def make_vectors(self, mlp_out, splits):
-        return [mlp_out[:, start:end] for (start, end) in splits]
-    
-    '''
-    def broadcasting(self, vecs):
-        n = len(vecs)
-        if n == 1:
-            return vecs[0]
-        letters = [ch for ch in string.ascii_lowercase if ch != "b"]
-        dim_syms = letters[:n]
+        return torch.split(mlp_out, splits, dim=1)
 
-        inputs = [f"b{sym}" for sym in dim_syms]
-        out = "b" + "".join(dim_syms)
-        eq = ",".join(inputs) + "->" + out
-
-        return torch.einsum(eq, *vecs)
-    '''
-
-    # changing to this was faster than einsum (less kernel launches)
-    def broadcasting(self, vecs):
+    # use einsum instead of this
+    def broadcasting(self, vecs, unsqueeze):
         n = len(vecs)
         if n == 1:
             return vecs[0]
@@ -175,61 +102,161 @@ class HyperNetwork(nn.Module):
             v_view = v.view(*shape)
             out = out * v_view
         return out
+
+    # use this broadcasting function when ignoring tensors
+    # def broadcasting(self, vecs, unsqueeze):
+    #     if len(vecs) == 1:
+    #         return vecs[0]
+    #     v0, v1 = vecs
+    #     out = v0.unsqueeze(2) * v1.unsqueeze(1)
+    #     if unsqueeze:
+    #         out = out.unsqueeze(-1).unsqueeze(-1)
+    #     return out
     
-    def make_update(self, mlp_out, splits):
+    def make_update(self, mlp_out, splits, unsqueeze):
         v = self.make_vectors(mlp_out, splits)
-        return self.broadcasting(v)
-
-
-    def forward_multiple_mlp(self, u):
-        if u.dim() == 1:
-            u = u.unsqueeze(0)
-        outs = [None] * len(self.hyper_layers)
-        new_params = {}
-        default_stream = torch.cuda.current_stream()
-        
-        # wait on default stream to finish prepping anything for mlps
-        for s in self.streams:
-            s.wait_stream(default_stream)
-
-        # mlp forward pass on designated stream, give chance to parallelize?
-        for (name, mlp_idx, splits, base) in self.jobs:
-            s = self.streams[mlp_idx]
-            with torch.cuda.stream(s):
-                outs[mlp_idx] = self.hyper_layers[mlp_idx](u)
-
-        # wait on mlps to be done before doing updates
-        for s in self.streams:
-            default_stream.wait_stream(s)
-
-        new_params = {}
-        for (name, mlp_idx, splits, base) in self.jobs:
-            update = self.make_update(outs[mlp_idx], splits)
-            new_params[name] = base.unsqueeze(0) + update
-        
-        return new_params
+        return self.broadcasting(v, unsqueeze)
     
+    def forward(self, U):
+        u = self.preprocess_step(U)
+        Y = self.batched_mlp(u)
+        new_params = {}
 
-    def forward_one_mlp(self, u):
-        if u.dim() == 1:
-            u = u.unsqueeze(0)
-        B = u.shape[0]
-        new_params = OrderedDict()
-        mlp_out = self.mlp(u)
-        for name, param in self.network.named_parameters():            
-            if name not in self.param_splits:
-                new_params[name] = param.unsqueeze(0).expand(B, *param.shape)
+        for (name, mlp_idx, splits, base, unsqueeze) in self.jobs:
+            mlp_out = Y[mlp_idx]
+            update = self.make_update(mlp_out, splits, unsqueeze)
+            if name in new_params:
+                new_params[name] = new_params[name] + update
             else:
-                splits = self.param_splits[name]
-                update = self.make_update(mlp_out, splits)
-
-                new_params[name] = param.unsqueeze(0) + update
+                new_params[name] = base.unsqueeze(0) + update
 
         return new_params
-    
 
-    def forward(self, u):
-        if self.one_mlp:
-            return self.forward_one_mlp(u)
-        else:
-            return self.forward_multiple_mlp(u)
+
+class GroupedBatchedMLP(nn.Module):
+    """
+    A collection of batched MLPs grouped by identical output dimension.
+
+    Each group contains M_g independent MLPs with the same:
+      - in_dim
+      - hidden_dim
+      - num_hidden_layers
+      - out_dim   (shared within the group)
+
+    This avoids padding all MLPs to one global max_out - this gave inflated model parameter count
+    """
+
+    def __init__(self, out_dims, in_dim, hidden_dim, num_hidden_layers, activation=F.silu, device=None, dtype=None,):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.num_hidden_layers = num_hidden_layers
+        self.activation = activation
+
+        # Build groups: out_dim -> list of global mlp indices
+        groups = defaultdict(list)
+        for global_idx, out_dim in enumerate(out_dims):
+            groups[int(out_dim)].append(global_idx)
+
+        self.group_out_dims = sorted(groups.keys())
+        self.group_to_global = {str(out_dim): groups[out_dim] for out_dim in self.group_out_dims}
+        self.global_to_group = {}
+
+        # Metadata for mapping global MLP index -> (group_key, local_idx)
+        for out_dim in self.group_out_dims:
+            global_indices = groups[out_dim]
+            for local_idx, global_idx in enumerate(global_indices):
+                self.global_to_group[global_idx] = (str(out_dim), local_idx)
+
+        # One batched sub-MLP per out_dim group
+        self.groups = nn.ModuleDict()
+        for out_dim in self.group_out_dims:
+            M_g = len(groups[out_dim])
+            self.groups[str(out_dim)] = _BatchedMLPExactOut(
+                M=M_g,
+                in_dim=in_dim,
+                hidden_dim=min(int(out_dim*0.5) + 1,512), # hard coding this for now
+                out_dim=out_dim,
+                num_hidden_layers=num_hidden_layers,
+                activation=activation,
+                device=device,
+                dtype=dtype,
+            )
+
+    def forward_grouped(self, x):
+        return {
+            key: module(x)
+            for key, module in self.groups.items()
+        }
+
+    def forward(self, x):
+        grouped = self.forward_grouped(x)
+        out = {}
+        for key, Y in grouped.items():
+            global_indices = self.group_to_global[key]
+            for local_idx, global_idx in enumerate(global_indices):
+                out[global_idx] = Y[local_idx]
+        return out
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters())
+
+
+class _BatchedMLPExactOut(nn.Module):
+    """
+    A stack of M independent MLPs with the same exact out_dim.
+    """
+    def __init__(self, M, in_dim, hidden_dim, out_dim, num_hidden_layers, activation=F.silu, device=None, dtype=None,):
+        super().__init__()
+        self.M = M
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.num_hidden_layers = num_hidden_layers
+        self.activation = activation
+
+        self.W_in = nn.Parameter(torch.empty(M, hidden_dim, in_dim, device=device, dtype=dtype))
+        self.b_in = nn.Parameter(torch.empty(M, hidden_dim, device=device, dtype=dtype))
+
+        L = num_hidden_layers
+        self.W_h = nn.Parameter(torch.empty(L, M, hidden_dim, hidden_dim, device=device, dtype=dtype))
+        self.b_h = nn.Parameter(torch.empty(L, M, hidden_dim, device=device, dtype=dtype))
+
+        self.W_out = nn.Parameter(torch.empty(M, out_dim, hidden_dim, device=device, dtype=dtype))
+        self.b_out = nn.Parameter(torch.empty(M, out_dim, device=device, dtype=dtype))
+
+        self.reset_parameters()
+        self.dropout = nn.Dropout(0.1)
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.W_in)
+        nn.init.zeros_(self.b_in)
+
+        for k in range(self.num_hidden_layers):
+            nn.init.xavier_normal_(self.W_h[k])
+            nn.init.zeros_(self.b_h[k])
+
+        nn.init.xavier_normal_(self.W_out)
+        nn.init.zeros_(self.b_out)
+
+    def bmm_linear(self, X_mb_i, W_m_o_i, b_m_o):
+        # X: (M, B, in), W: (M, out, in), b: (M, out)
+        return torch.bmm(X_mb_i, W_m_o_i.transpose(1, 2)) + b_m_o[:, None, :]
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        # (B, in_dim) -> (M, B, in_dim)
+        x = x.unsqueeze(0).expand(self.M, B, self.in_dim)
+
+        h = self.bmm_linear(x, self.W_in, self.b_in)
+        h = self.activation(h)
+
+        for k in range(self.num_hidden_layers):
+            h = self.bmm_linear(h, self.W_h[k], self.b_h[k])
+            h = self.activation(h)
+            h = self.dropout(h)
+
+        out = self.bmm_linear(h, self.W_out, self.b_out)
+        return out
