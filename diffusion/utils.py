@@ -2,10 +2,9 @@ import json
 import torch
 import io
 import os
-from models import UNet
+from models import *
 from tformer import TransformerModel
 from hypernet import HyperNetwork
-from preprocess import PoolPyramidConditioner
 
 def createModel(*,
                data_shape,
@@ -92,64 +91,46 @@ def loadTransformerModel(filename):
 
 # Hypernet _________________________________________________
 
-def createPoolPyramidConditioner(*, C, sizes=(32, 16, 8), device="cpu"):
-    return PoolPyramidConditioner(
-        C=C,
-        sizes=sizes,
-    ).to(device)
-
-
 def load_hypernet(hnet_path, model, device):
-    # multiple mlp version
-    num_mlp_layers = 10
-    one_mlp = False
-    hyper_hidden_scale = 1.0
-    H, W, C_state = 256, 256, 1
-    cond = PoolPyramidConditioner(C=C_state, sizes=(32, 16, 8)).to(device)
-    in_dim =  cond.out_dim
-
-    hnet = HyperNetwork(num_mlp_layers, in_dim, hyper_hidden_scale, one_mlp, model, device).to(device)
+    num_mlp_layers = 2
+    hidden_dim = 512
+    hnet = HyperNetwork(hidden_dim, num_mlp_layers, model, device, rank=2).to(device)
     hnet.load_state_dict(torch.load(hnet_path, map_location=device, weights_only=True))
     hnet.eval()
-    return hnet, cond
+    return hnet
 
-def resume_training(output_dir, epoch_to_resume, model, optimizer, device, use_hypernet, hypernet=None, optimizer_hyper=None):
-    # model ckpt
-    opt_ckpt_path = os.path.join(
-        output_dir,
-        f"optimizer_lr_epoch_gs_{epoch_to_resume}.pt"
-    )
+def resume_training(output_dir, epoch_to_resume, device, use_hypernet,hypernet=None):
+    opt_ckpt_path = os.path.join(output_dir, f"optimizer_lr_epoch_gs_{epoch_to_resume}.pt")
     model_ckpt = os.path.join(output_dir, f"model_epoch_{epoch_to_resume}.pt")
+
+    print(f"Loading model weights from {model_ckpt}")
     model = loadModel(model_ckpt, device)
     model.train()
 
     print(f"Loading optimizer state from {opt_ckpt_path}")
     opt_ckpt = torch.load(opt_ckpt_path, map_location=device)
 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=opt_ckpt["lr"])
     optimizer.load_state_dict(opt_ckpt["optimizer"])
+
     start_epoch = opt_ckpt["epoch"] + 1
     global_step = opt_ckpt["global_step"]
 
     for g in optimizer.param_groups:
         g["lr"] = opt_ckpt["lr"]
 
-
     if use_hypernet:
-        hyper_ckpt = os.path.join(
-            output_dir,
-            f"hypernet_epoch_{epoch_to_resume}.pt"
-        )
-
+        hyper_ckpt = os.path.join(output_dir, f"hypernet_epoch_{epoch_to_resume}.pt")
         print(f"Loading hypernet weights from {hyper_ckpt}")
-        hypernet.load_state_dict(torch.load(hyper_ckpt, map_location=device))
-        hypernet.to(device)
+        hypernet = load_hypernet(hyper_ckpt, model, device)
         hypernet.train()
 
+        optimizer_hyper = torch.optim.Adam(hypernet.parameters(), lr=opt_ckpt["lr_hyper"])
         optimizer_hyper.load_state_dict(opt_ckpt["optimizer_hyper"])
 
         for g in optimizer_hyper.param_groups:
             g["lr"] = opt_ckpt["lr_hyper"]
-            
+
         return model, start_epoch, global_step, optimizer, hypernet, optimizer_hyper
-    else:
-        return model, start_epoch, global_step, optimizer
+
+    return model, start_epoch, global_step, optimizer
